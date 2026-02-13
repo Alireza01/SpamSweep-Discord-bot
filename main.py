@@ -1,5 +1,4 @@
 import discord
-from discord import app_commands
 from discord.ext import commands
 import asyncio
 
@@ -12,110 +11,102 @@ intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-DELETE_DELAY = 2  # 2 seconds between deletes
-
+DELETE_DELAY = 2  # seconds
+SCAN_LIMIT = 200  # last 200 messages per channel
 MESSAGEABLE_TYPES = (
     discord.TextChannel,
     discord.Thread,
-    discord.VoiceChannel,   # Only if text chat enabled
+    discord.VoiceChannel,
     discord.ForumChannel
 )
 
-
-@bot.tree.command(name="spammer", description="Delete identical spam messages and ban senders (reply required)")
-async def spammer(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.ban_members:
-        await interaction.response.send_message("❌ You need Ban Members permission.", ephemeral=True)
-        return
-
-    if not interaction.channel.permissions_for(interaction.guild.me).read_message_history:
-        await interaction.response.send_message("❌ I can't read message history here.", ephemeral=True)
-        return
-
-    # Must be a reply
-    if not interaction.message.reference:
-        await interaction.response.send_message("❌ Please reply to a spam message.", ephemeral=True)
-        return
-
-    replied_message = await interaction.channel.fetch_message(interaction.message.reference.message_id)
-    lead_spammer = replied_message.author
-    spam_content = replied_message.content.strip()
-
-    if not spam_content:
-        await interaction.response.send_message("❌ Cannot target empty message.", ephemeral=True)
-        return
-
-    await interaction.response.send_message(
-        f"🔍 Scanning server for messages matching the spam from {lead_spammer}..."
-    )
-
-    join_date = lead_spammer.joined_at
-    banned_users = set()
+async def delete_user_messages(interaction, user: discord.Member):
     deleted_count = 0
 
-    for channel in interaction.guild.channels:
-        # Get all messageable channels
+    for ch in interaction.guild.channels:
         channels_to_scan = []
 
-        if isinstance(channel, discord.TextChannel):
-            channels_to_scan.append(channel)
-            # Include active threads
+        if isinstance(ch, discord.TextChannel):
+            channels_to_scan.append(ch)
             try:
-                threads = [t for t in channel.threads if t.is_active()]
-                channels_to_scan.extend(threads)
+                channels_to_scan.extend([t for t in ch.threads if t.is_active()])
+            except:
+                pass
+        elif isinstance(ch, discord.Thread):
+            channels_to_scan.append(ch)
+        elif isinstance(ch, discord.VoiceChannel):
+            if ch.guild.me.permissions_in(ch).read_message_history:
+                channels_to_scan.append(ch)
+        elif isinstance(ch, discord.ForumChannel):
+            try:
+                channels_to_scan.extend([t for t in await ch.active_threads() if t.is_active()])
             except:
                 pass
 
-        elif isinstance(channel, discord.Thread):
-            channels_to_scan.append(channel)
-
-        elif isinstance(channel, discord.VoiceChannel):
-            if channel.guild.me.permissions_in(channel).read_message_history:
-                channels_to_scan.append(channel)
-
-        elif isinstance(channel, discord.ForumChannel):
-            try:
-                threads = [t for t in await channel.active_threads() if t.is_active()]
-                channels_to_scan.extend(threads)
-            except:
-                pass
-
-        for ch in channels_to_scan:
-            if not ch.permissions_for(interaction.guild.me).read_message_history:
+        for scan_ch in channels_to_scan:
+            if not scan_ch.permissions_for(interaction.guild.me).read_message_history:
                 continue
-
             try:
-                async for message in ch.history(limit=None, after=join_date):
-                    if message.content.strip() == spam_content:
-                        # Delete message
+                async for message in scan_ch.history(limit=SCAN_LIMIT):
+                    if message.author.id == user.id:
                         try:
                             await message.delete()
                             deleted_count += 1
                             await asyncio.sleep(DELETE_DELAY)
                         except:
                             continue
-
-                        # Ban user if not already banned & not admin/owner
-                        if (
-                            message.author.id not in banned_users
-                            and not message.author.guild_permissions.administrator
-                            and message.author != interaction.guild.owner
-                        ):
-                            try:
-                                await interaction.guild.ban(
-                                    message.author,
-                                    reason=f"Spam detected via /spammer"
-                                )
-                                banned_users.add(message.author.id)
-                            except:
-                                continue
             except:
                 continue
 
-    await interaction.followup.send(
-        f"✅ Deleted {deleted_count} spam messages.\n"
-        f"🔨 Banned {len(banned_users)} users."
-    )
+    return deleted_count
 
+@bot.tree.command(name="bancleanup", description="Ban a user and delete their recent messages (reply required)")
+async def bancleanup(interaction: discord.Interaction):
+    channel = interaction.channel
+
+    # Only allow users with Manage Channels
+    if not channel.permissions_for(interaction.user).manage_channels:
+        await interaction.response.send_message(
+            "❌ You need Manage Channels permission to use this command.", ephemeral=True
+        )
+        return
+
+    if not interaction.channel.permissions_for(interaction.guild.me).ban_members:
+        await interaction.response.send_message(
+            "❌ I do not have permission to ban members.", ephemeral=True
+        )
+        return
+
+    if not interaction.message.reference:
+        await interaction.response.send_message(
+            "❌ Please reply to a user's message to use this command.", ephemeral=True
+        )
+        return
+
+    replied_message = await interaction.channel.fetch_message(interaction.message.reference.message_id)
+    target_user = replied_message.author
+
+    # Safety check: skip admins / owner
+    if target_user.guild_permissions.administrator or target_user == interaction.guild.owner:
+        await interaction.response.send_message(
+            "❌ Cannot ban admins or the server owner.", ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(f"🔨 Banning {target_user} and cleaning up recent messages...")
+
+    # Ban the user
+    try:
+        await interaction.guild.ban(target_user, reason=f"Banned by {interaction.user} using bancleanup")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to ban {target_user}: {e}")
+        return
+
+    # Delete recent messages
+    deleted_count = await delete_user_messages(interaction, target_user)
+
+    await interaction.followup.send(
+        f"✅ {target_user} was banned and {deleted_count} messages deleted."
+    )
 
 bot.run(TOKEN)
